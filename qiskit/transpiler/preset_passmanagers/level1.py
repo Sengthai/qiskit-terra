@@ -155,6 +155,8 @@ def level_1_pass_manager(pass_manager_config: PassManagerConfig) -> StagedPassMa
         routing_pass = LookaheadSwap(coupling_map, search_depth=4, search_width=4)
     elif routing_method == "sabre":
         routing_pass = SabreSwap(coupling_map, heuristic="lookahead", seed=seed_transpiler)
+    elif routing_method == "sabre-noise-adaptive":
+        routing_pass = SabreSwap(coupling_map, heuristic="lookahead", seed=seed_transpiler, backend_pro=backend_properties)    
     elif routing_method == "toqm":
         HAS_TOQM.require_now("TOQM-based routing")
         from qiskit_toqm import ToqmSwap, ToqmStrategyO1, latencies_from_target

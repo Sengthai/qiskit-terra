@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 EXTENDED_SET_SIZE = 20  # Size of lookahead window. TODO: set dynamically to len(current_layout)
 EXTENDED_SET_WEIGHT = 0.5  # Weight of lookahead window compared to front_layer.
+EXTENDED_GATE_ERROS_SET_SIZE = 500
 
 DECAY_RATE = 0.001  # Decay coefficient for penalizing serial swaps.
 DECAY_RESET_INTERVAL = 5  # How often to reset all decay rates to 1.
@@ -72,6 +73,7 @@ class SabreSwap(TransformationPass):
         heuristic="basic",
         seed=None,
         fake_run=False,
+        backend_pro=None,
     ):
         r"""SabreSwap initializer.
 
@@ -135,6 +137,37 @@ class SabreSwap(TransformationPass):
         else:
             self.coupling_map = deepcopy(coupling_map)
             self.coupling_map.make_symmetric()
+        
+        # TODO: add condition if version > 1: check the plot_error_map
+        
+        self.cx_gate_error = None
+        self.single_gate_error = None
+
+        if backend_pro:
+            num_qubits = len(backend_pro.qubits)
+            cmap = self.coupling_map.get_edges()
+            props_dict = backend_pro.to_dict()
+            cx_errors = []
+            if cmap:
+                if num_qubits < 20:
+                    for edge in cmap:
+                        if not [edge[1], edge[0]] in cmap:
+                            break
+                for line in cmap:
+                    for item in props_dict["gates"]:
+                        if item["qubits"] == list(line):
+                            cx_errors.append(item["parameters"][0]["value"])
+                            break
+
+            self.cx_gate_error = np.mean(cx_errors)
+
+            gate_errors = []
+            for gate in backend_pro.gates:
+                if len(gate.qubits) < 2:
+                    uu = backend_pro.gate_error(gate.gate, gate.qubits[0])
+                    if uu == 0.0: continue
+                    gate_errors.append(uu)
+            self.single_gate_error = np.mean(gate_errors)
 
         self.heuristic = heuristic
         self.seed = seed
@@ -143,7 +176,8 @@ class SabreSwap(TransformationPass):
         self.qubits_decay = None
         self._bit_indices = None
         self.dist_matrix = None
-
+        self.backend_pro = backend_pro
+        
     def run(self, dag):
         """Run the SabreSwap pass on `dag`.
 
@@ -191,6 +225,16 @@ class SabreSwap(TransformationPass):
         self.required_predecessors = self._build_required_predecessors(dag)
         num_search_steps = 0
         front_layer = dag.front_layer()
+        
+        self.temp_gates = {} 
+
+        def record_predecessor_gates(qarg, node, is_cx = False):
+            if qarg in self.temp_gates:
+                self.temp_gates[qarg][str(int(is_cx)+1)+"q_gate"] += 1
+                self.temp_gates[qarg]['gate'] = node
+            else:
+                self.temp_gates[qarg] = {'gate': node, '1q_gate':0, '2q_gate':0}
+                self.temp_gates[qarg][str(int(is_cx)+1)+"q_gate"] += 1
 
         while front_layer:
             execute_gate_list = []
@@ -200,6 +244,8 @@ class SabreSwap(TransformationPass):
             for node in front_layer:
                 if len(node.qargs) == 2:
                     v0, v1 = node.qargs
+                    record_predecessor_gates(v0, node, is_cx=True)
+                    record_predecessor_gates(v1, node, is_cx=True)
                     # Accessing layout._v2p directly to avoid overhead from __getitem__ and a
                     # single access isn't feasible because the layout is updated on each iteration
                     if self.coupling_map.graph.has_edge(
@@ -209,6 +255,7 @@ class SabreSwap(TransformationPass):
                     else:
                         new_front_layer.append(node)
                 else:  # Single-qubit gates as well as barriers are free
+                    record_predecessor_gates(node.qargs[0], node)
                     execute_gate_list.append(node)
             front_layer = new_front_layer
 
@@ -264,12 +311,31 @@ class SabreSwap(TransformationPass):
                 trial_layout.swap(*swap_qubits)
                 score = self._score_heuristic(
                     self.heuristic, front_layer, extended_set, trial_layout, swap_qubits
-                )
+                ) 
+                # if self.backend_pro:
+                #     gate_error_score = self._compute_gate_error_cost(swap_qubits[0], swap_qubits[1], current_layout, dag)
+                #     score -= (gate_error_score) 
                 swap_scores[swap_qubits] = score
             min_score = min(swap_scores.values())
             best_swaps = [k for k, v in swap_scores.items() if v == min_score]
             best_swaps.sort(key=lambda x: (self._bit_indices[x[0]], self._bit_indices[x[1]]))
-            best_swap = rng.choice(best_swaps)
+            
+            # Choose the best SWAP besed on gate error
+            best_swap = None
+            if self.backend_pro:
+                best_swap = best_swaps.pop()
+                best_score = self._compute_gate_error_cost(best_swap[0], best_swap[1], current_layout, dag)
+
+                for swap in best_swaps:
+                    temp_score = self._compute_gate_error_cost(swap[0], swap[1], current_layout, dag)
+                    if temp_score > best_score: 
+                        best_score = temp_score
+                        best_swap = swap
+            else:
+                best_swap = rng.choice(best_swaps)
+            
+            # best_swap = rng.choice(best_swaps)
+
             swap_node = self._apply_gate(
                 mapped_dag,
                 DAGOpNode(op=SwapGate(), qargs=best_swap),
@@ -399,7 +465,78 @@ class SabreSwap(TransformationPass):
             cost += self.dist_matrix[layout_map[node.qargs[0]], layout_map[node.qargs[1]]]
         return cost
 
-    def _score_heuristic(self, heuristic, front_layer, extended_set, layout, swap_qubits=None):
+    def _get_gates_name(self, node, qubit, dag, gates: list = [], count = 0):
+           
+        if count > EXTENDED_GATE_ERROS_SET_SIZE:
+            return gates
+
+        gates.append(node.name)
+        count += 1
+        for n in dag.successors(node):
+            if hasattr(n, 'qargs') and hasattr(n, 'name') and qubit in n.qargs:
+                if n.name == 'barrier' or n.name == 'measure':
+                    continue
+                return self._get_gates_name(n, qubit, dag, gates, count)
+        return gates
+
+    def _get_gate_error(self, gate_name: str, physical_qubit):
+        """Return the gate errors
+        """
+        if gate_name == 'cx':
+            return  self.cx_gate_error
+        # return 1 - (0.5 * ( 1 - exp(-0.00201 * self.backend_pro.gate_error(gate_name, physical_qubit))))
+        return self.backend_pro.gate_error(gate_name, physical_qubit)
+
+
+    def _compute_endurance_error(self, qubit):
+        
+        if qubit not in self.temp_gates: return 0
+
+        total_single_gate_error = self.temp_gates[qubit]['1q_gate'] * self.single_gate_error
+        total_cx_gate_error = self.temp_gates[qubit]['2q_gate'] * self.cx_gate_error
+        total_gate_error = total_cx_gate_error + total_single_gate_error
+        endurance_error = total_gate_error # should add more value
+        return endurance_error
+
+    def _compute_gate_error_cost(self, q1, q2, layout, dag):
+        score_original = 0
+        score_comparation = 0
+        gates_q1 = []
+        gates_q2 = []
+        endurance_q1 = self._compute_endurance_error(q1)
+        endurance_q2 = self._compute_endurance_error(q2)
+        
+        cost_origin_q1, cost_com_q1 = 0, 0
+        cost_origin_q2, cost_com_q2 = 0, 0
+
+        layout_map = layout._v2p
+
+        if q1 in self.temp_gates:          
+            gates_q1 = self._get_gates_name(self.temp_gates[q1]['gate'], q1, dag, gates_q1)
+
+        if q2 in self.temp_gates:
+            gates_q2 = self._get_gates_name(self.temp_gates[q2]['gate'], q2, dag, gates_q2)
+
+        for gate_q1 in gates_q1:
+            cost_origin_q1 += self._get_gate_error(gate_q1, layout_map[q1])
+            cost_com_q2 += self._get_gate_error(gate_q1, layout_map[q2])
+
+        for gate_q2 in gates_q2:
+            cost_origin_q2 += self._get_gate_error(gate_q2, layout_map[q2])
+            cost_com_q1 += self._get_gate_error(gate_q2, layout_map[q1])
+            
+        score_original = max(endurance_q1 + cost_origin_q1, endurance_q2 + cost_origin_q2)
+        score_comparation = max(endurance_q1 + cost_com_q1, endurance_q2 + cost_com_q2)
+        
+        score = score_original - score_comparation
+
+        # Swap decompose to 3 CNOT gates
+        # if score < self.cx_gate_error * 3:
+        #     return 0
+
+        return score
+
+    def _score_heuristic(self, heuristic, front_layer, extended_set, layout, swap_qubits=None, endurance_score=None):
         """Return a heuristic score for a trial layout.
 
         Assuming a trial layout has resulted from a SWAP, we now assign a cost
